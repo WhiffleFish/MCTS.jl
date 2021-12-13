@@ -37,7 +37,7 @@ policy = solve(solver, mdp)
 state = GridWorldState(1,1)
 
 @testset "basic" begin
-    a = @inferred action(policy, state)
+    a = @inferred Symbol action(policy, state)
 
     tree = policy.tree
     @test get_state_node(tree, state).id == 1
