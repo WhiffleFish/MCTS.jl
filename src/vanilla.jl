@@ -1,3 +1,5 @@
+using Base.Threads
+
 """
 MCTS solver type
 
@@ -102,7 +104,6 @@ mutable struct ActionNode{A}
     n::Int
     q::Float64
 end
-ActionNode(id::Int, a::A, n::Int, q::Float64) where A = ActionNode{A}(id, a, n, q)
 
 # Accessors for action nodes
 @inline POMDPs.action(n::ActionNode) = n.a_label
@@ -115,12 +116,12 @@ mutable struct StateNode{S,A}
     s_label::S
     total_n::Int
     child_nodes::Vector{ActionNode{A}}
-    s_lock::ReentrantLock
+    s_lock::Threads.SpinLock
     # Action nodes currently being evaluated. Used for applying virtual loss.
     a_selected::Set{A}
 end
 StateNode(id::Int, s::S, total_n::Int, a_nodes::Vector{ActionNode{A}}) where {S,A} =
-    StateNode{S,A}(id, s, total_n, a_nodes, ReentrantLock(), Set{A}())
+    StateNode{S,A}(id, s, total_n, a_nodes, Threads.SpinLock(), Set{A}())
 
 # Accessors for state nodes
 @inline state(n::StateNode) = n.s_label
@@ -139,8 +140,8 @@ mutable struct MCTSTree{S,A}
 
     # Locks and others needed for multithreaded MCTS.
     # TODO(kykim): Also support a lock-free approach.
-    states_lock::ReentrantLock
-    vis_stats_lock::ReentrantLock
+    states_lock::Threads.SpinLock
+    vis_stats_lock::Threads.SpinLock
 
     function MCTSTree{S,A}(root::Union{Nothing, S}=nothing) where {S,A}
         return new(root,
@@ -150,8 +151,8 @@ mutable struct MCTSTree{S,A}
                    Threads.Atomic{Int}(1),
                    Threads.Atomic{Int}(1),
 
-                   ReentrantLock(),
-                   ReentrantLock())
+                   Threads.SpinLock(),
+                   Threads.SpinLock())
     end
 end
 
@@ -278,7 +279,7 @@ function build_tree(planner::AbstractMCTSPlanner, s)
         root = insert_node!(tree, planner, s)
     end
 
-    timeout_us = CPUtime_us() + planner.solver.max_time * 1e6
+    tf = time() + planner.solver.max_time
     # Run simulation in a sequential manner in case of single thread. The
     # Channel approach below seems more efficient only if multiple threads are
     # used. This is presumably due that in case of single thread a lot of time
@@ -286,7 +287,7 @@ function build_tree(planner::AbstractMCTSPlanner, s)
     if Threads.nthreads() == 1
         for n in 1:n_iterations
             simulate(planner, tree, root, depth)
-            CPUtime_us() > timeout_us && break
+            time() > tf && break
         end
         return tree
     end
@@ -296,11 +297,11 @@ function build_tree(planner::AbstractMCTSPlanner, s)
     # TODO(kykim): See if the two cases can be more concisely combined.
     sim_channel = Channel{Task}(min(1000, n_iterations)) do channel
         for n in 1:n_iterations
-            put!(channel, Threads.@spawn simulate(planner, tree, root, depth, timeout_us))
+            put!(channel, Threads.@spawn simulate(planner, tree, root, depth, tf))
         end
     end
     for sim_task in sim_channel
-        CPUtime_us() > timeout_us && break
+        time() > tf && break
         try
             fetch(sim_task)  # Throws a TaskFailedException if failed.
         catch err
@@ -310,9 +311,16 @@ function build_tree(planner::AbstractMCTSPlanner, s)
     return tree
 end
 
+function backpropagate(snode::StateNode, sanode::ActionNode, q::Float64)
+    snode.total_n += 1
+    sanode.n += 1
+    sanode.q = (q - sanode.q) / sanode.n  # Moving average of Q value
+    delete!(snode.a_selected, sanode.a_label)
+end
 
-function simulate(planner::AbstractMCTSPlanner, tree::MCTSTree, snode::StateNode, depth::Int64, timeout_us::Float64=0.0)
+function simulate(planner::AbstractMCTSPlanner, tree::MCTSTree, snode::StateNode, depth::Int64, tf::Float64=0.0)
     mdp = planner.mdp
+    γ = discount(mdp)
     rng = planner.rng
     s = state(snode)
     solver = planner.solver
@@ -320,33 +328,30 @@ function simulate(planner::AbstractMCTSPlanner, tree::MCTSTree, snode::StateNode
     # Once depth is zero return.
     if isterminal(planner.mdp, s)
         return 0.0
-    elseif depth == 0 || (timeout_us > 0.0 && CPUtime_us() > timeout_us)
+    elseif depth == 0 || (time() > tf)
         return estimate_value(planner.solved_estimate, planner.mdp, s, depth)
     end
 
     # Pick action using UCT.
+    # println("$(Threads.threadid()) best_sanode_UCB")
     sanode = run_optlock(() -> best_sanode_UCB(snode, solver.exploration_constant, solver.virtual_loss), snode.s_lock)
 
     # Transition to a new state.
     sp, r = @gen(:sp, :r)(mdp, s, action(sanode), rng)
 
+    # println("$(Threads.threadid()) get(tree.states)")
     spnode = run_optlock(() -> get(tree.states, sp, nothing), tree.states_lock)
-    if spnode == nothing
+    if isnothing(spnode)
         spnode = insert_node!(tree, planner, sp)
-        q = r + discount(mdp) * estimate_value(planner.solved_estimate, planner.mdp, sp, depth - 1)
+        q = r + γ * estimate_value(planner.solved_estimate, planner.mdp, sp, depth - 1)
     else
-        q = r + discount(mdp) * simulate(planner, tree, spnode, depth - 1, timeout_us)
+        q = r + γ * simulate(planner, tree, spnode, depth - 1, tf)
     end
     if solver.enable_tree_vis
+        # println("$(Threads.threadid()) record_visit!")
         run_optlock(() -> record_visit!(tree, sanode.id, spnode.id), tree.vis_stats_lock)
     end
 
-    function backpropagate(snode::StateNode, sanode::ActionNode, q::Float64)
-        snode.total_n += 1
-        sanode.n += 1
-        sanode.q = (q - sanode.q) / sanode.n  # Moving average of Q value
-        delete!(snode.a_selected, sanode.a_label)
-    end
     run_optlock(() -> backpropagate(snode, sanode, q), snode.s_lock)
 
     return q
@@ -465,7 +470,7 @@ function best_sanode_UCB(snode::StateNode, c::Float64, virtual_loss::Float64=0.0
             best = sanode
         end
     end
-    run_optlock(() -> push!(snode.a_selected, best.a_label), snode.s_lock)
+    push!(snode.a_selected, best.a_label)
     return best
 end
 
