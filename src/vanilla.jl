@@ -62,41 +62,19 @@ Fields:
         be recorded. If it is false, the tree cannot be visualized.
         default: false
 """
-mutable struct MCTSSolver <: AbstractMCTSSolver
-    n_iterations::Int64
-    max_time::Float64
-    depth::Int64
-    exploration_constant::Float64
-    rng::AbstractRNG
-    estimate_value::Any
-    init_Q::Any
-    init_N::Any
-    virtual_loss::Float64
-    reuse_tree::Bool
-    enable_tree_vis::Bool
+Base.@kwdef mutable struct MCTSSolver{IN, IQ} <: AbstractMCTSSolver
+    n_iterations::Int = 100
+    max_time::Float64 = Inf
+    depth::Int = 10
+    exploration_constant::Float64 = 1.0
+    rng::AbstractRNG = Random.GLOBAL_RNG
+    estimate_value::Any = RolloutEstimator(RandomSolver(rng))
+    init_Q::IQ = 0.0
+    init_N::IN = 0
+    virtual_loss::Float64 = 0.0
+    reuse_tree::Bool = false
+    enable_tree_vis::Bool = false
 end
-
-"""
-    MCTSSolver()
-
-Use keyword arguments to specify values for the fields.
-"""
-function MCTSSolver(;n_iterations::Int64=100,
-                     max_time::Float64=Inf,
-                     depth::Int64=10,
-                     exploration_constant::Float64=1.0,
-                     rng=Random.GLOBAL_RNG,
-                     estimate_value=RolloutEstimator(RandomSolver(rng)),
-                     init_Q=0.0,
-                     init_N=0,
-                     virtual_loss::Float64=0.0,
-                     reuse_tree::Bool=false,
-                     enable_tree_vis::Bool=false)
-    return MCTSSolver(n_iterations, max_time, depth, exploration_constant, rng,
-                      estimate_value, init_Q, init_N, virtual_loss, reuse_tree,
-                      enable_tree_vis)
-end
-
 
 mutable struct ActionNode{A}
     id::Int
@@ -106,9 +84,9 @@ mutable struct ActionNode{A}
 end
 
 # Accessors for action nodes
-@inline POMDPs.action(n::ActionNode) = n.a_label
-@inline n(n::ActionNode) = n.n
-@inline q(n::ActionNode) = n.q
+POMDPs.action(n::ActionNode) = n.a_label
+n(n::ActionNode) = n.n
+q(n::ActionNode) = n.q
 
 
 mutable struct StateNode{S,A}
@@ -116,43 +94,44 @@ mutable struct StateNode{S,A}
     s_label::S
     total_n::Int
     child_nodes::Vector{ActionNode{A}}
-    s_lock::Threads.SpinLock
+    s_lock::SpinLock
     # Action nodes currently being evaluated. Used for applying virtual loss.
     a_selected::Set{A}
 end
+
 StateNode(id::Int, s::S, total_n::Int, a_nodes::Vector{ActionNode{A}}) where {S,A} =
-    StateNode{S,A}(id, s, total_n, a_nodes, Threads.SpinLock(), Set{A}())
+    StateNode{S,A}(id, s, total_n, a_nodes, SpinLock(), Set{A}())
 
 # Accessors for state nodes
-@inline state(n::StateNode) = n.s_label
-@inline total_n(n::StateNode) = n.total_n
-@inline children(n::StateNode) = n.child_nodes
+state(n::StateNode) = n.s_label
+total_n(n::StateNode) = n.total_n
+children(n::StateNode) = n.child_nodes
 
 
 mutable struct MCTSTree{S,A}
-    root::Union{Nothing, S}
-    states::Dict{S, StateNode}
+    root::S
+    states::Dict{S, StateNode{S,A}}
 
     # Maps (said=>sid)=>number of transitions. THIS MAY CHANGE IN THE FUTURE
-    _vis_stats::Union{Nothing, Dict{Pair{Int,Int}, Int}}
-    _s_id_counter::Threads.Atomic{Int}
-    _a_id_counter::Threads.Atomic{Int}
+    _vis_stats::Dict{Pair{Int,Int}, Int}
+    _s_id_counter::Atomic{Int}
+    _a_id_counter::Atomic{Int}
 
     # Locks and others needed for multithreaded MCTS.
     # TODO(kykim): Also support a lock-free approach.
-    states_lock::Threads.SpinLock
-    vis_stats_lock::Threads.SpinLock
+    states_lock::SpinLock
+    vis_stats_lock::SpinLock
 
-    function MCTSTree{S,A}(root::Union{Nothing, S}=nothing) where {S,A}
+    function MCTSTree{S,A}(root::S) where {S,A}
         return new(root,
-                   Dict{S, StateNode}(),
+                   Dict{S, StateNode{S,A}}(),
 
                    Dict{Pair{Int,Int},Int}(),
-                   Threads.Atomic{Int}(1),
-                   Threads.Atomic{Int}(1),
+                   Atomic{Int}(0),
+                   Atomic{Int}(0),
 
-                   Threads.SpinLock(),
-                   Threads.SpinLock())
+                   SpinLock(),
+                   SpinLock())
     end
 end
 
@@ -166,27 +145,28 @@ Return the StateNode in the tree corresponding to s.
 """
 get_state_node(tree::MCTSTree, s) = tree.states[s]
 
-
-mutable struct MCTSPlanner{P<:Union{MDP,POMDP}, S, A, SE, RNG} <: AbstractMCTSPlanner{P}
-    solver::MCTSSolver # contains the solver parameters
+struct MCTSPlanner{SOL<:MCTSSolver,P<:Union{MDP,POMDP}, S, A, SE, RNG} <: AbstractMCTSPlanner{P}
+    solver::SOL # contains the solver parameters
     mdp::P # model
-    tree::Union{Nothing,MCTSTree{S,A}} # the search tree
+    tree::MCTSTree{S,A}
     solved_estimate::SE
     rng::RNG
 end
 
 
 function MCTSPlanner(solver::MCTSSolver, mdp::Union{POMDP,MDP})
-    tree = MCTSTree{statetype(mdp), actiontype(mdp)}()
+    s0 = rand(initialstate(mdp))
+    tree = MCTSTree{statetype(mdp), actiontype(mdp)}(s0)
     se = convert_estimator(solver.estimate_value, solver, mdp)
     return MCTSPlanner(solver, mdp, tree, se, solver.rng)
 end
 
-
-"""
-Delete existing decision tree.
-"""
-function clear_tree!(p::MCTSPlanner{S,A}) where {S,A} p.tree = nothing end
+function Base.empty!(tree::MCTSTree)
+    empty!(tree.states)
+    empty!(tree._vis_stats)
+    tree._s_id_counter = Atomic{Int}(0)
+    tree._a_id_counter = Atomic{Int}(0)
+end
 
 """
     get_state_node(tree::MCTSTree, s, planner::MCTSPlanner)
@@ -220,36 +200,23 @@ POMDPs.action(p::AbstractMCTSPlanner, s) = first(action_info(p, s))
 """
 Query the tree for a value estimate at state s. If the planner does not already have a tree, run the planner first.
 """
-function POMDPs.value(planner::MCTSPlanner, s)
-    if planner.tree == nothing
-        plan!(planner, s)
-    end
-    return value(planner.tree, s)
-end
-
+POMDPs.value(planner::MCTSPlanner, s) = value(planner.tree, s)
 
 function POMDPs.value(tree::MCTSTree, s)
     snode = get(tree.states, s, nothing)
-    if snode == nothing
-        error("State $s not present in MCTS tree.")
-    end
+    isnothing(snode) && error("State $s not present in MCTS tree.")
     return maximum(q(san) for san in children(snode))
 end
 
 
 function POMDPs.value(planner::MCTSPlanner{<:Union{POMDP,MDP}, S, A}, s::S, a::A) where {S,A}
-    if planner.tree == nothing
-        plan!(planner, s)
-    end
     return value(planner.tree, s, a)
 end
 
 
 function POMDPs.value(tree::MCTSTree{S,A}, s::S, a::A) where {S,A}
     for san in children(tree.states[s]) # slow search through children
-        if action(san) == a
-            return q(san)
-        end
+        action(san) == a && return q(san)
     end
 end
 
@@ -258,28 +225,35 @@ end
 Build tree and store it in the planner.
 """
 function plan!(planner::AbstractMCTSPlanner, s)
-    tree = build_tree(planner, s)
-    planner.tree = tree
-    return tree
+    build_tree!(planner, s)
+    return planner.tree
 end
 
 
-function build_tree(planner::AbstractMCTSPlanner, s)
-    n_iterations = planner.solver.n_iterations
-    depth = planner.solver.depth
+function build_tree!(planner::AbstractMCTSPlanner, s)
+    sol = planner.solver
+    n_iterations = sol.n_iterations
+    depth = sol.depth
+    max_time = sol.max_time
+    S,A = statetype(planner.mdp), actiontype(planner.mdp)
 
+    tree = planner.tree
+    tree.root = s
+    
+    local root::StateNode{S,A}
     if planner.solver.reuse_tree
-        tree = planner.tree
+        tmp_root = get(tree.states, s, nothing)
+        if isnothing(tmp_root)
+            root = insert_node!(tree, planner, s)
+        else
+            root = tmp_root
+        end
     else
-        tree = MCTSTree{statetype(planner.mdp), actiontype(planner.mdp)}(s)
-    end
-
-    root = get(tree.states, s, nothing)
-    if root == nothing
+        empty!(tree)
         root = insert_node!(tree, planner, s)
     end
 
-    tf = time() + planner.solver.max_time
+    tf = time() + max_time
     # Run simulation in a sequential manner in case of single thread. The
     # Channel approach below seems more efficient only if multiple threads are
     # used. This is presumably due that in case of single thread a lot of time
@@ -318,7 +292,7 @@ function backpropagate(snode::StateNode, sanode::ActionNode, q::Float64)
     delete!(snode.a_selected, sanode.a_label)
 end
 
-function simulate(planner::AbstractMCTSPlanner, tree::MCTSTree, snode::StateNode, depth::Int64, tf::Float64=0.0)
+function simulate(planner::MCTSPlanner, tree::MCTSTree{S,A}, snode::StateNode{S,A}, depth::Int, tf::Float64=0.0) where {S,A}
     mdp = planner.mdp
     γ = discount(mdp)
     rng = planner.rng
@@ -328,7 +302,7 @@ function simulate(planner::AbstractMCTSPlanner, tree::MCTSTree, snode::StateNode
     # Once depth is zero return.
     if isterminal(planner.mdp, s)
         return 0.0
-    elseif depth == 0 || (time() > tf)
+    elseif iszero(depth) || (time() > tf)
         return estimate_value(planner.solved_estimate, planner.mdp, s, depth)
     end
 
@@ -373,9 +347,8 @@ end
 end
 
 
-function insert_node!(tree::MCTSTree, planner::MCTSPlanner, s)
+function insert_node!(tree::MCTSTree{S,A}, planner::MCTSPlanner, s::S) where {S,A}
     total_n = 0
-    A = actiontype(typeof(planner.mdp))
     a_nodes = Vector{ActionNode{A}}()
     for a in actions(planner.mdp, s)
         n = init_N(planner.solver.init_N, planner.mdp, s, a)
@@ -455,15 +428,6 @@ function best_sanode_UCB(snode::StateNode, c::Float64, virtual_loss::Float64=0.0
             end
             UCB = q(sanode) + c*sqrt(log(sn)/n(sanode)) - vloss
         end
-
-        if isnan(UCB)
-            @show sn
-            @show n(sanode)
-            @show q(sanode)
-        end
-
-        @assert !isnan(UCB)
-        @assert !isequal(UCB, -Inf)
 
         if UCB > best_UCB
             best_UCB = UCB
