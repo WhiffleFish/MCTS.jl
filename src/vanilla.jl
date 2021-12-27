@@ -239,7 +239,7 @@ function build_tree!(planner::AbstractMCTSPlanner, s)
 
     tree = planner.tree
     tree.root = s
-    
+
     local root::StateNode{S,A}
     if planner.solver.reuse_tree
         tmp_root = get(tree.states, s, nothing)
@@ -288,7 +288,7 @@ end
 function backpropagate(snode::StateNode, sanode::ActionNode, q::Float64)
     snode.total_n += 1
     sanode.n += 1
-    sanode.q = (q - sanode.q) / sanode.n  # Moving average of Q value
+    sanode.q = sanode.q + (q - sanode.q) / sanode.n  # Moving average of Q value
     delete!(snode.a_selected, sanode.a_label)
 end
 
@@ -307,26 +307,35 @@ function simulate(planner::MCTSPlanner, tree::MCTSTree{S,A}, snode::StateNode{S,
     end
 
     # Pick action using UCT.
-    # println("$(Threads.threadid()) best_sanode_UCB")
-    sanode = run_optlock(() -> best_sanode_UCB(snode, solver.exploration_constant, solver.virtual_loss), snode.s_lock)
+    lock(snode.s_lock)
+        sanode = best_sanode_UCB(snode, solver.exploration_constant, solver.virtual_loss)
+    unlock(snode.s_lock)
 
     # Transition to a new state.
     sp, r = @gen(:sp, :r)(mdp, s, action(sanode), rng)
 
-    # println("$(Threads.threadid()) get(tree.states)")
-    spnode = run_optlock(() -> get(tree.states, sp, nothing), tree.states_lock)
-    if isnothing(spnode)
+    local spnode::StateNode{S,A}
+
+    lock(tree.states_lock)
+        spnode_tmp = get(tree.states, sp, nothing)
+    unlock(tree.states_lock)
+
+    if isnothing(spnode_tmp)
         spnode = insert_node!(tree, planner, sp)
         q = r + γ * estimate_value(planner.solved_estimate, planner.mdp, sp, depth - 1)
     else
+        spnode = spnode_tmp
         q = r + γ * simulate(planner, tree, spnode, depth - 1, tf)
     end
     if solver.enable_tree_vis
-        # println("$(Threads.threadid()) record_visit!")
-        run_optlock(() -> record_visit!(tree, sanode.id, spnode.id), tree.vis_stats_lock)
+        lock(tree.vis_stats_lock)
+            record_visit!(tree, sanode.id, spnode.id)
+        unlock(tree.vis_stats_lock)
     end
 
-    run_optlock(() -> backpropagate(snode, sanode, q), snode.s_lock)
+    lock(snode.s_lock)
+        backpropagate(snode, sanode, q)
+    unlock(snode.s_lock)
 
     return q
 end
@@ -358,7 +367,9 @@ function insert_node!(tree::MCTSTree{S,A}, planner::MCTSPlanner, s::S) where {S,
         push!(a_nodes, a_node)
     end
     snode = StateNode(Threads.atomic_add!(tree._s_id_counter, 1), s, total_n, a_nodes)
-    run_optlock(() -> tree.states[s] = snode, tree.states_lock)
+    lock(tree.states_lock)
+        tree.states[s] = snode
+    unlock(tree.states_lock)
     return snode
 end
 
@@ -415,6 +426,7 @@ function best_sanode_UCB(snode::StateNode, c::Float64, virtual_loss::Float64=0.0
     best_UCB = -Inf
     best = first(children(snode))
     sn = total_n(snode)
+    logsn = log(sn)
     for sanode in children(snode)
         # if sn==0, log(sn) = -Inf. We want to avoid this.
         # in most cases, if n(sanode)==0, UCB will be Inf, which is desired,
@@ -426,7 +438,7 @@ function best_sanode_UCB(snode::StateNode, c::Float64, virtual_loss::Float64=0.0
             if virtual_loss > 0.0 && sanode.a_label in snode.a_selected
                 vloss = virtual_loss
             end
-            UCB = q(sanode) + c*sqrt(log(sn)/n(sanode)) - vloss
+            UCB = q(sanode) + c*sqrt(logsn/n(sanode)) - vloss
         end
 
         if UCB > best_UCB
